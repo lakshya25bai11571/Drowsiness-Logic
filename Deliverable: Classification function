@@ -1,0 +1,501 @@
+"""
+Module 3: Drowsiness Logic (Member 3)
+Core drowsiness detection algorithms, feature extraction, score fusion, and state classification.
+
+Responsibilities:
+- Detect possible yawning using mouth landmarks (MAR).
+- Estimate head pose to identify prolonged downward head movement (Pitch).
+- Combine eye closure (EAR / PERCLOS) and other signals into a drowsiness score.
+- Tune thresholds and reduce false alarms with temporal smoothing and hysteresis.
+- Deliverable: A function that classifies the current state as 'awake', 'warning', or 'drowsy'.
+"""
+
+import math
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple, Union
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Landmark Indices for MediaPipe Face Mesh (468/478 landmarks)
+# ---------------------------------------------------------------------------
+# Left eye landmarks (standard 6-point EAR configuration)
+LEFT_EYE_LANDMARKS = [33, 160, 158, 133, 153, 144]
+# Right eye landmarks (standard 6-point EAR configuration)
+RIGHT_EYE_LANDMARKS = [362, 385, 387, 263, 373, 380]
+
+# Inner & Outer mouth landmarks for Mouth Aspect Ratio (MAR)
+# 61: Left corner, 291: Right corner, 13: Upper lip center, 14: Lower lip center
+# 81, 178: Upper & lower inner left; 311, 402: Upper & lower inner right
+MOUTH_CORNER_LEFT = 61
+MOUTH_CORNER_RIGHT = 291
+MOUTH_LIP_UPPER = 13
+MOUTH_LIP_LOWER = 14
+MOUTH_TOP_INNER_L = 81
+MOUTH_BOTTOM_INNER_L = 178
+MOUTH_TOP_INNER_R = 311
+MOUTH_BOTTOM_INNER_R = 402
+
+# Landmarks used for 3D Head Pose Estimation (solvePnP)
+HEAD_POSE_LANDMARKS = {
+    "nose_tip": 1,
+    "chin": 199,
+    "left_eye_outer": 33,
+    "right_eye_outer": 263,
+    "left_mouth_corner": 61,
+    "right_mouth_corner": 291
+}
+
+# Generic 3D model points in world coordinates (mm)
+MODEL_POINTS_3D = np.array([
+    (0.0, 0.0, 0.0),          # Nose tip
+    (0.0, -330.0, -65.0),     # Chin
+    (-225.0, 170.0, -135.0),  # Left eye outer corner
+    (225.0, 170.0, -135.0),   # Right eye outer corner
+    (-150.0, -150.0, -125.0), # Left mouth corner
+    (150.0, -150.0, -125.0)   # Right mouth corner
+], dtype=np.float64)
+
+
+# ---------------------------------------------------------------------------
+# Thresholds and Tunable Configuration
+# ---------------------------------------------------------------------------
+@dataclass
+class DrowsinessConfig:
+    """Tuned thresholds to maximize accuracy and minimize false alarms."""
+    # Eye closure (EAR)
+    ear_threshold: float = 0.22          # EAR below this is considered eyes closed
+    eye_closed_consec_warning: int = 15   # ~0.5s at 30fps -> Warning
+    eye_closed_consec_drowsy: int = 30    # ~1.0s at 30fps -> Drowsy (Microsleep)
+
+    # Yawn detection (MAR)
+    mar_threshold: float = 0.60          # MAR above this indicates open mouth
+    yawn_consec_frames: int = 20         # ~0.7s at 30fps to avoid speech/laugh false alarms
+    yawn_decay_seconds: float = 15.0     # Recent yawn impact persists and decays
+
+    # Head Pose (Pitch - downward nodding)
+    # Note: Head down angle in degrees (convention: negative pitch = head looking down)
+    head_down_pitch_threshold: float = -12.0 # Degrees tilted downwards
+    head_down_consec_warning: int = 20   # ~0.7s sustained head down
+    head_down_consec_drowsy: int = 40    # ~1.3s sustained head down
+
+    # Signal fusion weights (total = 1.0)
+    weight_eye: float = 0.45             # Primary drowsiness indicator
+    weight_head_pose: float = 0.30       # Nodding off indicator
+    weight_yawn: float = 0.25            # Fatigue indicator
+
+    # Overall Drowsiness Score Thresholds (0.0 to 100.0)
+    score_warning_threshold: float = 40.0
+    score_drowsy_threshold: float = 70.0
+
+    # False alarm reduction parameters
+    perclos_window_size: int = 90        # ~3 seconds rolling window for PERCLOS
+    score_smoothing_alpha: float = 0.15  # EMA smoothing factor for drowsiness score
+    recovery_frames: int = 10            # Frames needed below threshold to clear warning/drowsy
+
+
+# ---------------------------------------------------------------------------
+# Feature Extraction Functions
+# ---------------------------------------------------------------------------
+def _euclidean_distance(pt1: Tuple[float, float], pt2: Tuple[float, float]) -> float:
+    """Compute 2D Euclidean distance between two points."""
+    return math.hypot(pt1[0] - pt2[0], pt1[1] - pt2[1])
+
+
+def calculate_ear(eye_points: List[Tuple[float, float]]) -> float:
+    """
+    Calculate Eye Aspect Ratio (EAR) from 6 landmark points.
+    eye_points: [p1, p2, p3, p4, p5, p6] where:
+      p1 = outer corner, p4 = inner corner
+      p2, p3 = upper lid points
+      p5, p6 = lower lid points
+    EAR = (|p2 - p6| + |p3 - p5|) / (2 * |p1 - p4|)
+    """
+    if len(eye_points) < 6:
+        return 0.0
+
+    v1 = _euclidean_distance(eye_points[1], eye_points[5])
+    v2 = _euclidean_distance(eye_points[2], eye_points[4])
+    h = _euclidean_distance(eye_points[0], eye_points[3])
+
+    if h < 1e-6:
+        return 0.0
+    return (v1 + v2) / (2.0 * h)
+
+
+def calculate_mar(mouth_points: Dict[str, Tuple[float, float]]) -> float:
+    """
+    Calculate Mouth Aspect Ratio (MAR) using mouth landmarks.
+    Mouth vertical openings normalized by horizontal mouth width.
+    """
+    left = mouth_points.get("left")
+    right = mouth_points.get("right")
+    top = mouth_points.get("top")
+    bottom = mouth_points.get("bottom")
+    top_l = mouth_points.get("top_l", top)
+    bottom_l = mouth_points.get("bottom_l", bottom)
+    top_r = mouth_points.get("top_r", top)
+    bottom_r = mouth_points.get("bottom_r", bottom)
+
+    if not left or not right or not top or not bottom:
+        return 0.0
+
+    horizontal = _euclidean_distance(left, right)
+    if horizontal < 1e-6:
+        return 0.0
+
+    v_center = _euclidean_distance(top, bottom)
+    v_left = _euclidean_distance(top_l, bottom_l) if top_l and bottom_l else v_center
+    v_right = _euclidean_distance(top_r, bottom_r) if top_r and bottom_r else v_center
+
+    # Multi-point average vertical distance over horizontal width
+    mar = (v_center + v_left + v_right) / (3.0 * horizontal)
+    return mar
+
+
+def estimate_head_pose_angles(
+    image_points: np.ndarray,
+    image_shape: Tuple[int, int]
+) -> Tuple[float, float, float]:
+    """
+    Estimate Head Pose (Pitch, Yaw, Roll in degrees) using cv2.solvePnP.
+    convention:
+      Pitch: negative = looking down, positive = looking up
+      Yaw: negative = looking right, positive = looking left
+      Roll: head tilt sideways
+    """
+    import cv2
+
+    h, w = image_shape[:2]
+    focal_length = w
+    center = (w / 2.0, h / 2.0)
+    camera_matrix = np.array([
+        [focal_length, 0, center[0]],
+        [0, focal_length, center[1]],
+        [0, 0, 1]
+    ], dtype=np.float64)
+    dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+
+    success, rotation_vector, translation_vector = cv2.solvePnP(
+        MODEL_POINTS_3D,
+        image_points.astype(np.float64),
+        camera_matrix,
+        dist_coeffs,
+        flags=cv2.SOLVEPNP_ITERATIVE
+    )
+
+    if not success:
+        return 0.0, 0.0, 0.0
+
+    rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+    proj_matrix = np.hstack((rotation_matrix, translation_vector))
+    _, _, _, _, _, _, euler_angles = cv2.decomposeProjectionMatrix(proj_matrix)
+
+    pitch = float(euler_angles[0][0])
+    yaw = float(euler_angles[1][0])
+    roll = float(euler_angles[2][0])
+
+    # Normalize pitch so downward head nodding is clearly negative
+    # Adjust for opencv decomposeProjectionMatrix angular wrapping
+    if pitch > 90:
+        pitch = pitch - 180
+    elif pitch < -90:
+        pitch = pitch + 180
+
+    return pitch, yaw, roll
+
+
+# ---------------------------------------------------------------------------
+# Drowsiness Logic Tracker and State Evaluator
+# ---------------------------------------------------------------------------
+@dataclass
+class DrowsinessResult:
+    """Detailed output produced for each evaluation step."""
+    state: str                          # "awake", "warning", or "drowsy"
+    drowsiness_score: float             # Combined score from 0.0 to 100.0
+    ear: float                          # Eye Aspect Ratio
+    mar: float                          # Mouth Aspect Ratio
+    pitch: float                        # Head Pitch (degrees)
+    yaw: float                          # Head Yaw (degrees)
+    roll: float                         # Head Roll (degrees)
+    perclos: float                      # Percentage of Eye Closure
+    is_eye_closed: bool                 # Instantaneous eye closure
+    is_yawning: bool                    # Active yawn detected
+    is_head_down: bool                  # Active downward head pose
+    eye_closed_frames: int              # Consecutive frames with closed eyes
+    yawn_frames: int                    # Consecutive frames of yawning
+    head_down_frames: int               # Consecutive frames of downward head
+    yawn_count: int                     # Total yawns detected in session
+    false_alarm_filtered: bool          # Whether an anomaly was suppressed
+
+
+class DrowsinessClassifier:
+    """
+    Main stateful classifier for Member 3: Drowsiness Logic.
+    Handles temporal buffering, feature fusion, noise rejection, and hysteresis.
+    """
+
+    def __init__(self, config: Optional[DrowsinessConfig] = None):
+        self.config = config or DrowsinessConfig()
+
+        # Frame counters
+        self.eye_closed_counter = 0
+        self.yawn_counter = 0
+        self.head_down_counter = 0
+        self.recovery_counter = 0
+
+        # Event statistics
+        self.total_yawns = 0
+        self.last_yawn_time = 0.0
+        self.is_currently_yawning = False
+
+        # Rolling buffers for false alarm reduction
+        self.ear_history = deque(maxlen=self.config.perclos_window_size)
+        self.eye_closed_history = deque(maxlen=self.config.perclos_window_size)
+        self.smoothed_score = 0.0
+
+        # Current state machine state
+        self.current_state = "awake"
+
+    def reset(self):
+        """Reset internal state history."""
+        self.eye_closed_counter = 0
+        self.yawn_counter = 0
+        self.head_down_counter = 0
+        self.recovery_counter = 0
+        self.total_yawns = 0
+        self.last_yawn_time = 0.0
+        self.is_currently_yawning = False
+        self.ear_history.clear()
+        self.eye_closed_history.clear()
+        self.smoothed_score = 0.0
+        self.current_state = "awake"
+
+    def process_signals(
+        self,
+        ear: float,
+        mar: float,
+        pitch: float,
+        yaw: float = 0.0,
+        roll: float = 0.0,
+        current_timestamp: Optional[float] = None
+    ) -> DrowsinessResult:
+        """
+        Process the primary physiological signals and evaluate drowsiness state.
+        """
+        if current_timestamp is None:
+            current_timestamp = time.time()
+
+        cfg = self.config
+
+        # 1. Eye Closure Signal & PERCLOS Calculation
+        is_eye_closed = ear < cfg.ear_threshold
+        if is_eye_closed:
+            self.eye_closed_counter += 1
+        else:
+            self.eye_closed_counter = 0
+
+        self.ear_history.append(ear)
+        self.eye_closed_history.append(1 if is_eye_closed else 0)
+
+        # PERCLOS: % of time eyes are closed over rolling window
+        perclos = (sum(self.eye_closed_history) / len(self.eye_closed_history)) * 100.0 if self.eye_closed_history else 0.0
+
+        # 2. Yawn Detection using Mouth Landmarks (MAR)
+        # Suppress brief openings (speaking, eating) using consecutive frame count
+        is_mouth_open = mar > cfg.mar_threshold
+        if is_mouth_open:
+            self.yawn_counter += 1
+        else:
+            if self.yawn_counter >= cfg.yawn_consec_frames and not self.is_currently_yawning:
+                # Registered a completed yawn event
+                self.total_yawns += 1
+                self.last_yawn_time = current_timestamp
+            self.yawn_counter = 0
+
+        is_yawning = self.yawn_counter >= cfg.yawn_consec_frames
+        self.is_currently_yawning = is_yawning
+        if is_yawning and self.last_yawn_time == 0.0:
+            self.last_yawn_time = current_timestamp
+
+        # 3. Head Pose Estimation (Prolonged downward movement)
+        is_head_down = pitch < cfg.head_down_pitch_threshold
+        if is_head_down:
+            self.head_down_counter += 1
+        else:
+            self.head_down_counter = 0
+
+        # -------------------------------------------------------------------
+        # 4. Multi-Signal Fusion into Composite Drowsiness Score (0 to 100)
+        # -------------------------------------------------------------------
+        # Eye Component (0 - 100):
+        # Normal blink (1-4 frames) gets almost 0 score; prolonged closure ramps up fast
+        if self.eye_closed_counter <= 4:
+            # Normal blink or open eyes
+            eye_component = min(perclos * 0.8, 25.0)
+        else:
+            # Sustained eye closure (microsleep risk)
+            closure_ratio = min(self.eye_closed_counter / cfg.eye_closed_consec_drowsy, 1.0)
+            eye_component = 30.0 + (closure_ratio * 70.0)
+
+        # Head Pose Component (0 - 100):
+        if self.head_down_counter <= 5:
+            head_component = 0.0
+        else:
+            head_ratio = min(self.head_down_counter / cfg.head_down_consec_drowsy, 1.0)
+            head_component = head_ratio * 100.0
+
+        # Yawn Component (0 - 100):
+        yawn_component = 0.0
+        if is_yawning:
+            yawn_component = 80.0
+        elif self.last_yawn_time > 0:
+            # Fatigue residual decay over time
+            elapsed = current_timestamp - self.last_yawn_time
+            if elapsed < cfg.yawn_decay_seconds:
+                yawn_component = max(0.0, 50.0 * (1.0 - (elapsed / cfg.yawn_decay_seconds)))
+
+        # Weighted Composite Score
+        raw_score = (
+            (eye_component * cfg.weight_eye) +
+            (head_component * cfg.weight_head_pose) +
+            (yawn_component * cfg.weight_yawn)
+        )
+        raw_score = float(np.clip(raw_score, 0.0, 100.0))
+
+        # Exponential Moving Average for Temporal Smoothing (reduces jitter)
+        self.smoothed_score = (cfg.score_smoothing_alpha * raw_score) + ((1.0 - cfg.score_smoothing_alpha) * self.smoothed_score)
+
+        # -------------------------------------------------------------------
+        # 5. State Classification with False Alarm Filtering and Hysteresis
+        # -------------------------------------------------------------------
+        # Direct severe triggers:
+        # Microsleep: eyes shut > drowsy threshold frames
+        microsleep_trigger = self.eye_closed_counter >= cfg.eye_closed_consec_drowsy
+        # Severe nodding off: head down > drowsy threshold frames
+        severe_nod_trigger = self.head_down_counter >= cfg.head_down_consec_drowsy
+        # Warning triggers
+        warning_eye_trigger = self.eye_closed_counter >= cfg.eye_closed_consec_warning
+        warning_nod_trigger = self.head_down_counter >= cfg.head_down_consec_warning
+
+        target_state = "awake"
+        if microsleep_trigger or severe_nod_trigger or self.smoothed_score >= cfg.score_drowsy_threshold:
+            target_state = "drowsy"
+        elif warning_eye_trigger or warning_nod_trigger or is_yawning or self.smoothed_score >= cfg.score_warning_threshold:
+            target_state = "warning"
+        else:
+            target_state = "awake"
+
+        # Apply Hysteresis:
+        # Escalation is immediate (safety critical)
+        # De-escalation requires consistent recovery frames to avoid alarm flapping
+        false_alarm_suppressed = False
+        if target_state == "drowsy":
+            self.current_state = "drowsy"
+            self.recovery_counter = 0
+        elif target_state == "warning":
+            if self.current_state == "drowsy":
+                self.recovery_counter += 1
+                if self.recovery_counter >= cfg.recovery_frames:
+                    self.current_state = "warning"
+                    self.recovery_counter = 0
+                else:
+                    false_alarm_suppressed = True
+            else:
+                self.current_state = "warning"
+                self.recovery_counter = 0
+        else:  # target is "awake"
+            if self.current_state != "awake":
+                self.recovery_counter += 1
+                if self.recovery_counter >= cfg.recovery_frames:
+                    self.current_state = "awake"
+                    self.recovery_counter = 0
+                else:
+                    false_alarm_suppressed = True
+            else:
+                self.current_state = "awake"
+                self.recovery_counter = 0
+
+        return DrowsinessResult(
+            state=self.current_state,
+            drowsiness_score=round(self.smoothed_score, 2),
+            ear=round(ear, 3),
+            mar=round(mar, 3),
+            pitch=round(pitch, 2),
+            yaw=round(yaw, 2),
+            roll=round(roll, 2),
+            perclos=round(perclos, 2),
+            is_eye_closed=is_eye_closed,
+            is_yawning=is_yawning,
+            is_head_down=is_head_down,
+            eye_closed_frames=self.eye_closed_counter,
+            yawn_frames=self.yawn_counter,
+            head_down_frames=self.head_down_counter,
+            yawn_count=self.total_yawns,
+            false_alarm_filtered=false_alarm_suppressed
+        )
+
+
+# ---------------------------------------------------------------------------
+# DELIVERABLE FUNCTION:
+# "A function that classifies the current state as awake, warning or drowsy"
+# ---------------------------------------------------------------------------
+# Global singleton instance for functional API calls
+_GLOBAL_CLASSIFIER: Optional[DrowsinessClassifier] = None
+
+
+def classify_state(
+    ear: float,
+    mar: float,
+    pitch: float,
+    yaw: float = 0.0,
+    roll: float = 0.0,
+    reset: bool = False
+) -> str:
+    """
+    Deliverable Function for Module 3 (Member 3).
+
+    Classifies the current driver state into:
+      - 'awake': Normal attentive state.
+      - 'warning': Early fatigue detected (yawn, brief drooping, elevated drowsiness score).
+      - 'drowsy': Critical drowsiness / microsleep / prolonged downward head tilt.
+
+    Args:
+        ear: Eye Aspect Ratio (typically 0.28-0.35 when open, <0.22 when closed)
+        mar: Mouth Aspect Ratio (typically <0.50 normal, >0.60 when yawning)
+        pitch: Head pitch in degrees (negative indicates looking down)
+        yaw: Head yaw in degrees (optional)
+        roll: Head roll in degrees (optional)
+        reset: If True, resets temporal history
+
+    Returns:
+        str: 'awake', 'warning', or 'drowsy'
+    """
+    global _GLOBAL_CLASSIFIER
+    if _GLOBAL_CLASSIFIER is None or reset:
+        _GLOBAL_CLASSIFIER = DrowsinessClassifier()
+
+    result = _GLOBAL_CLASSIFIER.process_signals(ear, mar, pitch, yaw, roll)
+    return result.state
+
+
+def classify_drowsiness_full(
+    ear: float,
+    mar: float,
+    pitch: float,
+    yaw: float = 0.0,
+    roll: float = 0.0,
+    classifier: Optional[DrowsinessClassifier] = None
+) -> DrowsinessResult:
+    """
+    Comprehensive functional interface returning full metrics, scores, and state.
+    """
+    global _GLOBAL_CLASSIFIER
+    if classifier is None:
+        if _GLOBAL_CLASSIFIER is None:
+            _GLOBAL_CLASSIFIER = DrowsinessClassifier()
+        classifier = _GLOBAL_CLASSIFIER
+
+    return classifier.process_signals(ear, mar, pitch, yaw, roll)
